@@ -26,7 +26,8 @@
 
 > :warning: 操作前请做好备份。
 
-对于 CentOS 8 Stream，使用以下命令替换默认的配置
+可以使用镜像源加速软件包下载速度。
+对于 CentOS 8 Stream，使用以下命令替换默认的配置。
 
 ```shell
 sudo sed -e 's|^mirrorlist=|#mirrorlist=|g' \
@@ -115,16 +116,100 @@ enabled=0
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
 ```
 
+#### 安装 openstack 软件仓库
+
+```shell
+dnf install -y centos-release-openstack-wallaby
+```
+
 #### 网络配置
 
-TODO
+##### 安装 openvswitch
+
+```shell
+dnf install -y openvswitch
+systemctl start openvswitch && systemctl enable openvswitch
+```
+
+##### 使用 network-scripts 配置网络
+
+```shell
+# 卸载NetworkManager
+dnf remove -y NetworkManager
+
+# 配置网桥
+vim /etc/sysconfig/network-scripts/ifcfg-br-ex
+DEVICE=br-ex
+ONBOOT=yes
+HOTPLUG=no
+NM_CONTROLLED=no
+PEERDNS=no
+DEVICETYPE=ovs
+TYPE=OVSBridge
+MTU=1500
+OVS_EXTRA="set bridge br-ex fail_mode=standalone -- del-controller br-ex"
+
+# 配置bond
+vim /etc/sysconfig/network-scripts/ifcfg-bond0
+DEVICE=bond0
+ONBOOT=yes
+HOTPLUG=no
+NM_CONTROLLED=no
+PEERDNS=no
+DEVICETYPE=ovs
+TYPE=OVSPort
+OVS_BRIDGE=br-ex
+BONDING_OPTS="mode=4 miimon=100"
+MTU=1500
+
+# 配置 bond 从属网卡
+vim /etc/sysconfig/network-scripts/ifcfg-eno1
+DEVICE=eno1
+ONBOOT=yes
+HOTPLUG=no
+NM_CONTROLLED=no
+PEERDNS=no
+MASTER=bond0
+SLAVE=yes
+BOOTPROTO=none
+MTU=1500
+
+vim /etc/sysconfig/network-scripts/ifcfg-eno2
+DEVICE=eno2
+ONBOOT=yes
+HOTPLUG=no
+NM_CONTROLLED=no
+PEERDNS=no
+MASTER=bond0
+SLAVE=yes
+BOOTPROTO=none
+MTU=1500
+
+# 配置ovs子接口
+vim /etc/sysconfig/network-scripts/ifcfg-vlan100
+DEVICE=vlan100
+ONBOOT=yes
+HOTPLUG=no
+NM_CONTROLLED=no
+PEERDNS=no
+DEVICETYPE=ovs
+TYPE=OVSIntPort
+OVS_BRIDGE=br-ex
+OVS_OPTIONS="tag=100"
+MTU=1500
+BOOTPROTO=static
+IPADDR=10.0.10.11
+NETMASK=255.255.255.0
+
+systemctl restart network
+```
 
 ## 在部署节点上进行
 
 ### 安装发行版的基础依赖包
 
 ```shell
-dnf install -y git vim python3 tmux python3-devel libffi-devel gcc openssl-devel python3-libselinux python3-netaddr
+dnf install -y git vim python3 sshpass tmux python3-devel libffi-devel gcc openssl-devel python3-libselinux python3-netaddr
 ```
 
 > :warning: 后续操作步骤可选择在 tmux 终端中进行，避免会话丢失造成部署过程中断。
@@ -151,6 +236,25 @@ mkdir -p /opt/oslostack && cd /opt/oslostack
 git clone https://github.com/ceph/ceph-ansible.git
 git clone https://opendev.org/openstack/kolla-ansible.git
 ```
+
+### 准备容器镜像
+
+#### 启动 docker registry
+```shell
+docker pull registry:2
+docker run -d -p 4000:5000 --restart always --name registry registry:2
+```
+
+#### ceph 容器镜像
+docker pull quay.io/ceph/daemon:latest-octopus
+docker tag quay.io/ceph/daemon:latest-octopus 10.0.10.11:4000/ceph/daemon:latest-octopus
+docker push 10.0.10.11:4000/ceph/daemon:latest-octopus
+
+#### openstack 容器镜像
+docker pull kolla/centos-source-nova-api:wallaby
+docker tag kolla/centos-source-nova-api:wallaby 10.0.10.11:4000/kolla/centos-source-nova-api:wallaby
+docker push 10.0.10.11:4000/kolla/centos-source-nova-api:wallaby
+...
 
 ### 准备 python 虚拟环境
 
@@ -191,11 +295,16 @@ vim /etc/hosts
 ### 修改 ansible 配置文件
 
 ```shell
+mkdir -p /etc/ansible
 vim /etc/ansible/ansible.cfg
 [defaults]
 host_key_checking=False
 pipelining=True
 forks=100
+log_path = /var/log/oslostack-ansible.log
+
+[privilege_escalation]
+become = True
 ```
 
 ### 填写 ansible inventory
@@ -252,12 +361,25 @@ control
 
 [osds:children]
 compute
+
+[grafana-server:children]
+mons
 ```
 
 ### 测试节点连通性
 
 ```shell
 ansible -i ./inventory all -m ping
+```
+
+### 节点初始化
+```shell
+# 添加占位符
+vim /etc/kolla/globals.yml
+---
+dummy:
+
+kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml bootstrap-servers -vv
 ```
 
 ## 使用 ceph-ansible 部署 ceph 分布式存储
@@ -288,7 +410,7 @@ git clone https://github.com/ceph/ceph-ansible.git
 
 ```shell
 cd ceph-ansible
-git checkout stable-6.0
+git checkout stable-5.0
 ```
 
 ### 填写 ceph-ansible 配置
@@ -301,7 +423,9 @@ vim oslostack.yml
 ```yml
 # ceph
 cephx: true
+ceph_docker_registry: "10.0.10.11:4000"
 containerized_deployment: true
+container_binary: docker
 ceph_origin: distro
 
 osd_scenario: lvm
@@ -315,6 +439,9 @@ cluster_network: "192.168.4.0/24"
 monitor_interface: eth1
 
 ntp_service_enabled: false
+
+dashboard_admin_password: oslostack
+grafana_admin_password: oslostack
 
 ceph_mgr_modules:
   - status
@@ -381,7 +508,7 @@ openstack_keys:
 
 ```shell
 cd /opt/oslostack
-ansible-playbook -i ./inventory ./ceph-ansible/site-container.yml.sample -e @/opt/oslostack/oslostack.yml
+ansible-playbook -i ./inventory ./ceph-ansible/site-container.yml.sample -e @/opt/oslostack/oslostack.yml -vv
 ```
 
 ## 使用 kolla-ansible 部署 OpenStack
@@ -400,6 +527,7 @@ vim oslostack.yml
 ```
 
 ```yml
+docker_registry: "10.0.10.11:4000"
 kolla_base_distro: "centos"
 kolla_install_type: "source"
 
@@ -449,10 +577,9 @@ cinder_ssd_backend_name: "ssd"
 ### 执行部署命令
 
 ```shell
-kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml bootstrap-servers
-kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml prechecks
-kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml deploy
-kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml post-deploy
+kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml prechecks -vv
+kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml deploy -vv
+kolla-ansible -i ./inventory -e @/opt/oslostack/oslostack.yml post-deploy -vv
 ```
 
 ### 使用 OpenStack
